@@ -11,9 +11,7 @@
 #include <sstream>
 #include <filesystem>
 
-#include "plf/plf.h"
-#include "mqs/mqs.h"
-#include "aminicserver.h"
+#include "server.h"
 #include "mysql.h"
 
 
