@@ -11,7 +11,6 @@
 #include <sstream>
 #include <filesystem>
 
-#include "amilink/amilink.h"
 #include "plf/plf.h"
 #include "mqs/mqs.h"
 #include "aminicserver.h"
@@ -108,21 +107,9 @@ static void* connectionHandler(void* pData)
     static int32_t connectionId = 0;
 
     std::unique_ptr<ThreadData> data(static_cast<ThreadData*>(pData));
-  
-    int connection = data->connection;
- 
-    uint64_t idDevice = 0;
-    connectionId++;
-    int32_t _connectionId = connectionId;
-    bool more = true;
-    if (sVerbose)
-    {
-        std::cout << "New connection " << _connectionId << std::endl;
-    }
-    int32_t msgCount = 0;
-    void* rawDataSetAssemblyBuffer = nullptr;
-    uint32_t maxAssemblyLength = 0; 
-    time_t lastMessage = time(nullptr);
+
+    //code for preparing the variables.
+   
     auto conn = data->mysqlManager->getConnection();
     while (more)
     {
@@ -132,7 +119,7 @@ static void* connectionHandler(void* pData)
         {
             std::cout << "Waiting for message " << msgCount << " on connection " << _connectionId << std::endl;
         }
-        int32_t messageLength = amilinkReadMessage(connection, request);
+        int32_t messageLength = ReadMessage(connection, request);
         if (messageLength > 0)
         {
             more = handleRequest(connection, idDevice, request, rawDataSetAssemblyBuffer, maxAssemblyLength, conn);        
@@ -142,11 +129,11 @@ static void* connectionHandler(void* pData)
         {
             time_t now = time(nullptr);
             bool activity = (lastMessage + MAX_INACTIVITY) > now;
-            more = activity && amilinkHeartbeat(connection);
+            more = activity && sendHeartbeat(connection);
         }
     }
     pool->returnConnection(conn); //?!
-    amilinkClose(connection);
+    CloseSocket(connection);
     if (sVerbose)
     {
         std::cout << "Terminating connection " << _connectionId << std::endl;
@@ -206,7 +193,7 @@ public:
     // Update the constructor to accept a shared pointer to MySqlConnectionManager
     Server(uint16_t port, bool verbose, std::shared_ptr<MySqlConnectionManager> mysqlManager)
     : sPort(port), sVerbose(verbose), mysqlManager(mysqlManager) {
-    sLink = amilinkListen(sPort); // Initialize listening on the specified port. // just like the old serverInit(uint16_t port, bool verbose)
+    sLink = Listen(sPort); // Initialize listening on the specified port. // just like the old serverInit(uint16_t port, bool verbose)
     }
 
     void start() {
