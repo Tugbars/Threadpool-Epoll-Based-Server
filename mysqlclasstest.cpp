@@ -18,9 +18,9 @@
 #include <thread>
 
 //#include "mysql.h"
-#include "mqs_def.h"
+//#include "mqs_def.h"
 
-#include <gtest/gtest.h>
+//#include <gtest/gtest.h>
 
 #include <fstream>
 #include <unordered_map>
