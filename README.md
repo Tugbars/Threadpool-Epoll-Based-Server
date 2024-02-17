@@ -38,7 +38,3 @@ To integrate this connection pool into your application, include the provided cl
 ## Compilation and Dependencies
 
 This project requires the MySQL Connector/C++ to interact with MySQL databases. Ensure that the connector is installed and properly configured in your build environment. Compile the application with a C++ compiler that supports C++11 or later.
-
-## Conclusion
-
-This MySQL Connection Pool and Server Management application exemplifies modern C++ practices for efficient and safe database connection management in multi-threaded applications. By leveraging RAII for resource management, ensuring thread safety, and maintaining a healthy connection pool, it provides a robust foundation for high-performance database operations.
