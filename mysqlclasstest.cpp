@@ -323,7 +323,7 @@ std::unique_ptr<MySqlConnectionManager> mysqlInit(bool verbose) {
         return nullptr; // Return nullptr to indicate failure
     }
 }
-
+//example code which is RAII compliant like the rest of the code.
 int getCompanyIDFromDevice(uint64_t deviceID, std::shared_ptr<sql::Connection> conn)
 {
     int companyID = 0; // Default value if no results are found
@@ -381,7 +381,7 @@ std::string getCurrentTimeAsString()
     oss << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S");
     return oss.str();
 }
-
+//example code number 2
 BatchInfo getStructBatchCodesByCurrentDate(int companyId, std::shared_ptr<sql::Connection> conn)
 {
     BatchInfo batchInfo;
@@ -428,7 +428,4 @@ BatchInfo getStructBatchCodesByCurrentDate(int companyId, std::shared_ptr<sql::C
 
     return batchInfo;
 }
-
-
-
 
