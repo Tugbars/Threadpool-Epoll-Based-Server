@@ -1,6 +1,6 @@
 # MySQL Connection Pool and Server Management
 
-This repository contains a C++ application designed to efficiently manage MySQL database connections through a connection pool, ensuring thread safety and adhering to RAII (Resource Acquisition Is Initialization) principles. The application demonstrates best practices for managing database connections, executing SQL queries securely, and handling resources in a multi-threaded environment.
+This repository contains a C++ application designed to efficiently manage MySQL database connections through a connection pool, ensuring thread safety and adhering to RAII principles. The application demonstrates best practices for managing database connections, executing SQL queries securely, and handling resources in a multi-threaded environment.
 
 ## Overview
 
