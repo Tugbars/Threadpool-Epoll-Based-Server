@@ -22,6 +22,11 @@
 static int sLink = -1;
 static bool sVerbose = false;
 
+struct ThreadData {
+    int connection; // Connection identifier or file descriptor
+    std::shared_ptr<MySqlConnectionManager> mysqlManager; // Shared pointer for thread safety and RAII
+};
+
 //Implementations of HandleCase1-8... and various helper functions. 
 
 
@@ -73,11 +78,6 @@ static bool handleRequest(int connection, uint64_t& idDevice, MqsCldMsg_t& reque
     }
     return more;
 }
-
-struct ThreadData {
-    int connection; // Connection identifier or file descriptor
-    std::shared_ptr<MySqlConnectionManager> mysqlManager; // Shared pointer for thread safety and RAII
-};
 
 /**
  * @brief Handles an individual client connection in a dedicated thread.
@@ -188,10 +188,8 @@ static void* connectionHandler(void* pData)
  */
 class Server {
 public:
-    // Update the constructor to accept a shared pointer to MySqlConnectionManager
     Server(uint16_t port, bool verbose, std::shared_ptr<MySqlConnectionManager> mysqlManager)
-    : sPort(port), sVerbose(verbose), mysqlManager(mysqlManager) {
-    sLink = Listen(sPort); // Initialize listening on the specified port. // just like the old serverInit(uint16_t port, bool verbose)
+    : sPort(port), sVerbose(verbose), mysqlManager(mysqlManager), running(false) {
     }
 
     void start() {
@@ -204,59 +202,61 @@ public:
         if (mainThread.joinable()) {
             mainThread.join();
         }
-        // Clean up resources, close connections, etc.
+        // Join all connection handler threads
+        for (auto& thread : connectionThreads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        connectionThreads.clear(); // Clear the list of threads after joining them
     }
 
-private:
-    void run() {
-        while (running) {
-            int connection = amilinkAccept(sLink); //just like the static void* serverThread(void* dummy)
-            if (connection < 0) {
-                continue; // Handle error or break if server is stopping
-            }
+    void cleanUpFinishedThreads() {
+        for (auto it = connectionThreads.begin(); it != connectionThreads.end(); ) {
+        if (!it->joinable()) {
+            // If the thread is not joinable, it has finished execution.
+            it = connectionThreads.erase(it);  // Erase returns the next iterator.
+        } else {
+            ++it;  // Move to the next thread.
+        }
+      }
+    }
 
-            // Make sure to capture mysqlManager in the lambda to use it inside connectionHandler
+void run() {
+    auto lastCleanupTime = std::chrono::steady_clock::now();  // Initialize the last cleanup time
+
+    while (running) {
+        // Attempt to accept a new connection
+        int connection = amilinkAccept(sLink);
+        if (connection >= 0) {  // Check if a new connection was successfully accepted
+            // Create thread data for the new connection
             auto threadData = std::make_shared<ThreadData>(ThreadData{connection, mysqlManager});
-            /**
-             * @brief Spawns and detaches a new thread for handling a client connection.
-             * 
-             * This code snippet creates a new thread dedicated to handling a specific client connection. The thread is 
-             * provided with a shared pointer to `ThreadData`, which contains the connection details and a shared pointer 
-             * to the `MySqlConnectionManager`. This allows the connection handler function to access the necessary 
-             * resources for processing the client request. After the thread is created, it is immediately detached,
-             * meaning it will run independently from the thread that spawned it. The detached thread is responsible for
-             * completing its task (handling the client connection) and will be automatically cleaned up by the system 
-             * once it finishes its execution.
-             * 
-             * Detaching a thread is useful in scenarios where the parent thread does not need to wait for the child 
-             * thread to finish before continuing its execution. This is particularly relevant for server applications 
-             * that handle multiple client connections simultaneously, allowing the server to remain responsive to new 
-             * connections while previous connections are being processed in the background.
-             * 
-             * @param threadData A `std::shared_ptr<ThreadData>` object containing the necessary data for the connection 
-             * handler, including the client connection identifier and a pointer to the MySQL connection manager. The 
-             * shared pointer ensures that the resources are managed safely across threads, adhering to RAII principles.
-             * 
-             * @note It is crucial to ensure that any shared resources accessed by the detached thread, such as the MySQL 
-             * connection manager, are thread-safe and properly synchronized to prevent data races or other concurrency 
-             * issues. Additionally, the lifetime of shared resources must be managed carefully to ensure they remain 
-             * valid for the duration of the thread's execution.
-             * 
-             * Usage of detached threads simplifies resource management but requires careful consideration of the detached 
-             * thread's lifetime and the thread-safety of shared resources.
-             */
-            std::thread([threadData]() {
+            // Spawn a new thread to handle the connection
+            connectionThreads.emplace_back([threadData]() {
                 connectionHandler(threadData.get());
-            }).detach(); // Detach the thread //bunu tam anlamıyorum işte. tam anlamadığım bu.
+                // The connectionHandler is responsible for the communication with this particular client
+            });
+        } else {
+            // If no new connection, sleep briefly to reduce busy-waiting
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        // Check if it's time to perform cleanup
+        auto currentTime = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastCleanupTime).count() >= 35000) {
+            cleanUpFinishedThreads();  // Perform the cleanup of finished threads
+            lastCleanupTime = currentTime;  // Reset the cleanup timer
         }
     }
 
     uint16_t sPort;
     bool sVerbose;
-    bool running = false;
-    std::shared_ptr<MySqlConnectionManager> mysqlManager; // Correctly store the mysqlManager
+    std::atomic<bool> running;
+    std::shared_ptr<MySqlConnectionManager> mysqlManager;
     std::thread mainThread;
+    std::vector<std::thread> connectionThreads; // Container for connection handler threads
 };
+
 
 //--------------------Global functions -------------------------------------------------------
 
@@ -298,7 +298,7 @@ void serverInit(uint16_t port, bool verbose) {
     std::cout << "Preparing to listen on port " << port << std::endl;
 
     // Initialize the MySQL connection manager, if not already initialized elsewhere.
-    auto mysqlManager = std::make_shared<MySqlConnectionManager>(verbose, "path/to/db_config.txt");
+    auto mysqlManager = std::make_shared<MySqlConnectionManager>(verbose, "db_config.txt");
     
     // Create and start the server instance.
     serverInstance = std::make_unique<Server>(port, verbose, mysqlManager);
@@ -306,4 +306,3 @@ void serverInit(uint16_t port, bool verbose) {
 
     std::cout << "Server initialized and listening on port " << port << std::endl;
 }
-
