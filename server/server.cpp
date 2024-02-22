@@ -315,7 +315,7 @@ public:
         while (running)
         {
             // Attempt to accept a new connection
-            int connection = amilinkAccept(sLink);
+            int connection = Accept(sLink);
             if (connection >= 0)
             { // Check if a new connection was successfully accepted
 
@@ -394,7 +394,7 @@ void serverInit(uint16_t port, bool verbose)
     {
         // Initialize MySqlConnectionManager
         sVerbose = verbose;
-        sLink = amilinkListen(port);
+        sLink = Listen(port);
 
         std::cout << "Preparing to listen on port " << port << std::endl;
         std::string configFile = "db_config.txt"; // Provide the path to the config file
