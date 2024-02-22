@@ -14,6 +14,8 @@
 #include "server.h"
 #include "mysql.h"
 
+#include <sys/epoll.h>
+
 
 //--------------------Local defines  -------------------------------------------------------
 
@@ -157,203 +159,6 @@ static void *connectionHandler(void *pData)
 }
 
 /**
- * @class Server
- * @brief Manages the lifecycle and operations of a network server, handling client connections concurrently.
- *
- * This class encapsulates the necessary functionality to initiate and manage a network server that listens on a specified port
- * and handles incoming connections in a multithreaded manner. It utilizes modern C++ features such as std::thread for handling
- * concurrency and std::shared_ptr for managing shared resources, adhering to the RAII (Resource Acquisition Is Initialization) principles.
- *
- * The server implements a main listening thread responsible for accepting incoming connections. For each new connection, it spawns
- * a separate thread to handle client-server interactions, allowing for the concurrent management of multiple client connections.
- * This design facilitates a structured and scalable approach to network server management compared to traditional, single-threaded servers.
- *
- * Each connection thread is given a shared pointer to a 'MySqlConnectionManager' instance, enabling independent and safe database interactions
- * for each client session. The server periodically checks (every 35 seconds) and cleans up threads that have finished execution, ensuring
- * efficient resource management and preventing resource leaks.
- *
- * @section threading Threading Model
- * The server operates primarily through two types of threads: one main thread and multiple connection handling threads. The main thread,
- * initiated in the `start()` method, is dedicated to listening for and accepting new client connections. Each accepted client connection
- * is then managed by a newly created thread.
- *
- * Connection handling threads are monitored and managed based on their activity; they are cleaned up if they have completed their tasks,
- * ensuring the server remains efficient in resource usage. This model supports handling multiple connections concurrently, improving the
- * server's scalability and responsiveness.
- *
- * @note While detaching threads was considered, this implementation ensures that all threads are properly joined upon server shutdown,
- * highlighting a structured approach to concurrency management. It's important to ensure that shared resources, particularly those accessed
- * by multiple threads, are adequately protected to prevent race conditions and ensure thread safety.
- *
- * @param sPort The port number on which the server listens for incoming connections.
- * @param sVerbose A boolean flag indicating whether verbose logging is enabled, aiding in debugging and monitoring.
- * @param mysqlManager A shared pointer to a 'MySqlConnectionManager' instance, used for handling database operations across multiple threads.
- *
- * This server class is built with thread safety and efficient resource management in mind. However, it's crucial to ensure that resources like
- * the database manager, accessible across multiple threads, are properly synchronized to avoid concurrent access issues.
- */
-class Server
-{
-public:
-    Server(uint16_t port, bool verbose, std::shared_ptr<MySqlConnectionManager> mysqlManager)
-        : sPort(port), sVerbose(verbose), running(false), mysqlManager(mysqlManager)
-    {
-        // Constructor body remains unchanged
-    }
-
-    void start()
-    {
-        running = true;
-        mainThread = std::thread(&Server::run, this);
-    }
-
-    ~Server() {
-    // Attempt to gracefully stop the server if it hasn't been stopped yet.
-    stop();
-    }
-
-    void stop()
-    {
-        running = false;
-        if (mainThread.joinable())
-        {
-            mainThread.join();
-        }
-        // Join all connection handler threads
-        for (auto &thread : connectionThreads)
-        {
-            if (thread.joinable())
-            {
-                thread.join();
-            }
-        }
-        connectionThreads.clear(); // Clear the list of threads after joining them
-    }
-
-    void cleanUpFinishedThreads()
-    {
-        for (auto it = connectionThreads.begin(); it != connectionThreads.end();)
-        {
-            if (!it->joinable())
-            {
-                // If the thread is not joinable, it has finished execution.
-                it = connectionThreads.erase(it); // Erase returns the next iterator.
-            }
-            else
-            {
-                ++it; // Move to the next thread.
-            }
-        }
-    }
-    /**
-     * @brief Executes the server's main loop.
-     *
-     * This method contains the main loop of the server, which continuously checks for new connections,
-     * creates threads to handle those connections, and cleans up finished threads. The loop runs as
-     * long as the 'running' flag is true. New connections are accepted using the amilinkAccept function.
-     * Each new connection initializes a ThreadData object and starts a new thread where connectionHandler
-     * is called to manage the connection. The method also periodically cleans up threads that have
-     * finished executing.
-     *
-     * @note The method uses std::chrono for managing time intervals and std::this_thread for sleep operations.
-     * It employs a lambda function to pass the connection handling routine to each new thread.
-     *
-     * Usage:
-     * This method is typically called from the start method of the Server class after initializing the server.
-     *
-     * Thread Safety:
-     * This method is intended to be called from a single thread (typically the main server thread). 
-     * However, it manages multiple threads internally for handling connections.
-     *
-     * @see start(), stop(), cleanUpFinishedThreads(), connectionHandler()
-     */
-    /**
-     * @details Inside the run method, the server continuously checks for new connections and handles each
-     * one in a separate thread. This is achieved using a lambda function and the emplace_back method of
-     * the std::vector container.
-     *
-     * The lambda function:
-     * A lambda function is an anonymous function object capable of capturing variables from its enclosing scope.
-     * In this context, the lambda captures the 'threadData' shared pointer, which contains data needed by the
-     * connectionHandler function. The lambda function is defined as follows:
-     *
-     * [threadData]() { connectionHandler(threadData.get()); }
-     *
-     * Here, 'threadData' is captured by value, ensuring that the shared pointer (and thus the pointed-to object)
-     * remains alive for the duration of the thread's execution. The lambda then calls 'connectionHandler',
-     * passing a raw pointer to the ThreadData object. This approach keeps the ThreadData instance alive
-     * until the thread completes, as the lambda's capture holds a reference count to the shared_ptr.
-     *
-     * The 'emplace_back' method:
-     * The emplace_back method is used to add a new element to the end of a vector. Unlike 'push_back',
-     * 'emplace_back' constructs the element in-place, reducing the need for temporary objects and copies.
-     * In the context of this server code, 'emplace_back' is used to construct a new std::thread object
-     * directly within the 'connectionThreads' vector:
-     *
-     * connectionThreads.emplace_back([threadData]() { connectionHandler(threadData.get()); });
-     *
-     * This line effectively creates and starts a new thread, running the lambda function as its task.
-     * Since 'emplace_back' constructs the thread in-place, it is more efficient than creating a temporary
-     * thread object and then moving it into the vector. The newly created thread immediately begins executing
-     * the lambda function, which, in turn, calls 'connectionHandler' with the necessary data.
-     *
-     * By using these techniques, the server efficiently manages multiple connections concurrently, with each
-     * connection being handled in a separate thread. The use of 'std::shared_ptr' for managing 'threadData'
-     * ensures that memory is properly managed and that the data remains valid for the duration of the thread's
-     * operation.
-     *
-     * @note It is crucial that 'threadData' is captured by value in the lambda to ensure the shared_ptr (and
-     * thus the memory for 'ThreadData') is not prematurely destroyed. This pattern is a common practice in
-     * C++ for managing resources in concurrent programming.
-     *
-     * @see std::thread, std::shared_ptr, std::vector::emplace_back
-     */
-    void run()
-    {
-        auto lastCleanupTime = std::chrono::steady_clock::now(); // Initialize the last cleanup time
-
-        while (running)
-        {
-            // Attempt to accept a new connection
-            int connection = Accept(sLink);
-            if (connection >= 0)
-            { // Check if a new connection was successfully accepted
-
-                auto threadData = std::make_shared<ThreadData>();
-                threadData->connection = connection;
-                threadData->mysqlManager = mysqlManager; // Assuming mysqlManager is a shared_ptr
-
-                connectionThreads.emplace_back([threadData = std::move(threadData)]() {
-                    connectionHandler(threadData.get());
-                });
-            }
-            else
-            {
-                // If no new connection, sleep briefly to reduce busy-waiting
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-
-            // Check if it's time to perform cleanup
-            auto currentTime = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastCleanupTime).count() >= 35000)
-            {
-                cleanUpFinishedThreads();      // Perform the cleanup of finished threads
-                lastCleanupTime = currentTime; // Reset the cleanup timer
-            }
-        }
-    }
-
-    uint16_t sPort;
-    bool sVerbose;
-    std::atomic<bool> running;
-    std::shared_ptr<MySqlConnectionManager> mysqlManager;
-    std::thread mainThread;
-    std::vector<std::thread> connectionThreads; // Container for connection handler threads
-};
-
-//--------------------Global functions -------------------------------------------------------
-
-/**
  * @brief Initializes and starts the server, including setting up the MySQL connection manager.
  *
  * This function configures the server based on the specified port and verbosity settings. It initializes
@@ -385,8 +190,256 @@ public:
  * incoming connections. The server will use the MySQL connection manager for database interactions, sharing
  * this resource among all connection handler threads.
  */
+class Server
+{
+public:
+    /**
+     * @brief Constructor for the Server class.
+     * @param port Port number on which the server will listen for incoming connections.
+     * @param verbose Flag indicating whether to log detailed operational messages.
+     * @param mysqlManager Shared pointer to an initialized MySqlConnectionManager for handling database operations.
+     */
+    Server(uint16_t port, bool verbose, std::shared_ptr<MySqlConnectionManager> mysqlManager)
+        : sPort(port), sVerbose(verbose), mysqlManager(mysqlManager), running(false), efd(-1) {}
 
-static Server* globalServer = nullptr;
+    /**
+     * @brief Destructor for the Server class.
+     *
+     * Cleans up resources used by the server, including closing the epoll file descriptor and the listening socket.
+     */
+    ~Server()
+    {
+        if (efd >= 0)
+            close(efd);
+        // if (sLink >= 0) close(sLink);
+    }
+
+    /**
+     * @brief Initializes the server's listening socket and epoll instance.
+     *
+     * Sets up the listening socket for non-blocking I/O and registers it with the epoll instance to monitor
+     * for incoming connection events.
+     *
+     * @return True if initialization was successful, false otherwise.
+     */
+    bool initialize()
+    {
+        /**
+         * @brief Configures the server's listening socket for non-blocking I/O and registers it with an epoll instance.
+         *
+         * This function performs the following steps:
+         * 1. Retrieves the current file status flags of the listening socket (sLink) using the F_GETFL command.
+         * 2. Checks if the retrieval was successful. If not, returns false indicating failure.
+         * 3. Sets the file descriptor to non-blocking mode by combining the current flags with O_NONBLOCK
+         *    using bitwise OR and applying them with the F_SETFL command.
+         * 4. Checks if setting the non-blocking mode was successful. If not, returns false indicating failure.
+         * 5. Creates an epoll instance for monitoring I/O events and stores the file descriptor of the new
+         *    instance in 'efd'.
+         * 6. Initializes an epoll_event structure to specify the interest in read events (EPOLLIN) for the
+         *    listening socket.
+         * 7. Registers the listening socket with the epoll instance using epoll_ctl with the EPOLL_CTL_ADD command,
+         *    to start monitoring for incoming connections.
+         *
+         * @return True if the listening socket was successfully set to non-blocking mode and registered with the epoll instance,
+         *         false otherwise.
+         *
+         * @note This setup allows the server to handle multiple client connections efficiently in a non-blocking manner,
+         *       using the epoll mechanism to get notified about I/O events without blocking the main thread.
+         */
+        // Example for setting non-blocking mode
+        int flags = fcntl(sLink, F_GETFL, 0);
+        if (flags == -1)
+            return false;
+        if (fcntl(sLink, F_SETFL, flags | O_NONBLOCK) == -1)
+            return false;
+
+        efd = epoll_create1(0);
+        if (efd == -1)
+            return false;
+
+        struct epoll_event event;
+        event.data.fd = sLink;
+        event.events = EPOLLIN; // Interested in read events
+        if (epoll_ctl(efd, EPOLL_CTL_ADD, sLink, &event) == -1)
+            return false;
+
+        return true;
+    }
+
+    /**
+     * @brief Starts the server's main loop in a separate thread.
+     *
+     * Initiates the asynchronous server operation, including listening for new connections
+     * and dispatching client requests to handler threads.
+     */
+    void start()
+    {
+        if (!initialize())
+        {
+            std::cerr << "Server initialization failed\n";
+            return;
+        }
+        running = true;
+        mainThread = std::thread(&Server::run, this);
+    }
+
+    /**
+     * @brief Stops the server's main loop and cleans up resources.
+     *
+     * Signals the server loop to stop and waits for the main thread and any active connection handler threads to join.
+     */
+    void stop()
+    {
+        running = false;
+        if (mainThread.joinable())
+        {
+            mainThread.join();
+        }
+    }
+
+    /**
+     * @brief Cleans up finished connection handler threads.
+     *
+     * Iterates through the list of active connection handler threads and removes any that have completed their execution.
+     */
+    void cleanUpFinishedThreads()
+    {
+        for (auto it = connectionThreads.begin(); it != connectionThreads.end();)
+        {
+            if (!it->joinable())
+            {
+                // If the thread is not joinable, it has finished execution.
+                it = connectionThreads.erase(it); // Erase returns the next iterator.
+            }
+            else
+            {
+                ++it; // Move to the next thread.
+            }
+        }
+    }
+
+    /**
+     * @brief Main loop for accepting and handling client connections.
+     *
+     * Continuously monitors the epoll instance for I/O events on the listening socket and connected client sockets.
+     * Accepts new connections, sets them to non-blocking mode, and dispatches them to handler threads.
+     */
+    void run()
+    {
+        auto lastCleanupTime = std::chrono::steady_clock::now(); // Initialize the last cleanup time
+
+        const int MAX_EVENTS = 10;
+        struct epoll_event events[MAX_EVENTS]; // Buffer where events are returned
+
+        while (running)
+        {
+            int n = epoll_wait(efd, events, MAX_EVENTS, -1); // Wait indefinitely for events
+
+            for (int i = 0; i < n; ++i)
+            {
+                if (events[i].data.fd == sLink)
+                {
+                    // New connection on the listening socket
+                    while (true)
+                    {
+                        int connection = amilinkAccept(sLink); // Use your existing accept function
+                        if (connection < 0)
+                        {
+                            if (errno != EAGAIN && errno != EWOULDBLOCK)
+                            {
+                                perror("accept");
+                            }
+                            break; // No more incoming connections
+                        }
+
+                        setNonBlocking(connection); // Set new connection to non-blocking mode
+
+                        struct epoll_event client_event;
+                        client_event.data.fd = connection;
+                        client_event.events = EPOLLIN | EPOLLET; // Read events, Edge Triggered mode
+                        if (epoll_ctl(efd, EPOLL_CTL_ADD, connection, &client_event) == -1)
+                        {
+                            perror("epoll_ctl: add");
+                            amilinkClose(connection); // Close the socket on error
+                        }
+                        else
+                        {
+                            auto threadData = std::make_shared<ThreadData>();
+                            threadData->connection = connection;
+                            threadData->mysqlManager = mysqlManager; // Assuming mysqlManager is a shared_ptr
+
+                            connectionThreads.emplace_back([threadData = std::move(threadData)]()
+                                                           { connectionHandler(threadData.get()); });
+                        }
+                    }
+                }
+                else
+                {
+                    // Existing connection has data or can be written
+                    // You might want to handle this directly or offload to another thread,
+                    // depending on your application's design
+                }
+            }
+
+            // Check if it's time to perform cleanup
+            auto currentTime = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastCleanupTime).count() >= 35000)
+            {
+                cleanUpFinishedThreads();      // Perform the cleanup of finished threads
+                lastCleanupTime = currentTime; // Reset the cleanup timer
+            }
+        }
+    }
+
+private:
+    /*
+     * @brief Discusses the benefits of non-blocking mode for I/O operations.
+     *
+     * Setting a file descriptor to non-blocking mode has several advantages,
+     * particularly in network programming and high-concurrency systems:
+     *
+     * - **Improved Resource Utilization**: In non-blocking mode, a thread does not
+     *   wait for an I/O operation to complete and can continue performing other
+     *   tasks. This leads to more efficient use of CPU resources compared to blocking mode,
+     *   where the thread is put to sleep.
+     *
+     * - **Increased Concurrency**: Allows a single thread to manage multiple I/O operations
+     *   on different file descriptors simultaneously, enhancing the concurrency of the application
+     *   without the need for multiple threads.
+     *
+     * - **Better Responsiveness and Throughput**: The server remains responsive under high load
+     *   and can continue to service new and ready connections, thus improving overall throughput
+     *   and user experience.
+     *
+     * - **Scalability**: Scales well with the number of client connections by minimizing the overhead
+     *   of managing multiple threads, especially beneficial under high network load.
+     *
+     * - **Control and Flexibility**: Offers more control over I/O operations, allowing the application
+     *   to implement sophisticated handling strategies such as batching, prioritizing, and custom
+     *   timeouts.
+     *
+     * Note: While non-blocking I/O increases performance and scalability, it also adds complexity
+     * to error handling and state management. Frameworks or libraries can help manage this complexity.
+     */
+    void setNonBlocking(int sock)
+    {
+        int flags = fcntl(sock, F_GETFL, 0);
+        if (flags != -1)
+        {
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        }
+    }
+
+    int sPort;                                            ///< Port number on which the server listens for incoming connections.
+    bool sVerbose;                                        ///< Flag indicating whether verbose logging is enabled.
+    std::atomic<bool> running;                            ///< Atomic flag controlling the main loop execution.
+    std::shared_ptr<MySqlConnectionManager> mysqlManager; ///< Shared pointer to the MySQL connection manager.
+    std::thread mainThread;                               ///< Thread object for the server's main loop.
+    int efd;                                              ///< File descriptor for the epoll instance.
+    std::vector<std::thread> connectionThreads;           ///< Container for active connection handler threads.
+};
+
+static Server *globalServer = nullptr;
 
 void serverInit(uint16_t port, bool verbose)
 {
@@ -394,7 +447,7 @@ void serverInit(uint16_t port, bool verbose)
     {
         // Initialize MySqlConnectionManager
         sVerbose = verbose;
-        sLink = Listen(port);
+        sLink = amilinkListen(port);
 
         std::cout << "Preparing to listen on port " << port << std::endl;
         std::string configFile = "db_config.txt"; // Provide the path to the config file
