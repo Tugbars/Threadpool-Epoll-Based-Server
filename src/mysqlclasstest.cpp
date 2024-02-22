@@ -1,30 +1,22 @@
 #include <stdlib.h>
 #include <iostream>
-#include <mysql_connection.h>
-#include <driver.h>
-#include <exception.h>
-#include <resultset.h>
-#include <statement.h>
-#include <prepared_statement.h>
+
 #include <sstream>
+#include <thread>
+#include <stdexcept>
 
 #include <chrono>  // For std::chrono
 #include <ctime>   // For std::time_t
 #include <iomanip> // For std::put_time
-
-#include <queue>
-#include <mutex>
 #include <memory>
-#include <thread>
 
-//#include "mysql.h"
+#include "mysql.h"
 #include "mqs_def.h"
-
-#include <gtest/gtest.h>
 
 #include <fstream>
 #include <unordered_map>
 
+static bool executeSqlSimple(const std::string &query, std::shared_ptr<sql::Connection> conn);
 
 std::unordered_map<std::string, std::string> loadConfig(const std::string& configFile) {
 	std::unordered_map<std::string, std::string> config;
@@ -51,64 +43,45 @@ std::unordered_map<std::string, std::string> loadConfig(const std::string& confi
 // check if these are correctly designed.
 
 /**
- * @class MySqlConnectionPool
- * @brief Manages a pool of connections to a MySQL database.
- *
- * MySqlConnectionPool implements a connection pool for MySQL connections. It maintains a specified number
- * of connections in a pool, allowing for efficient reuse across different parts of an application.
- * This class is designed to manage database connections in a way that avoids the overhead associated with
- * repeatedly opening and closing connections. It also handles invalid connections by replacing them with new ones.
- *
- * Usage:
- * - Create an instance of MySqlConnectionPool with the desired number of connections and database credentials.
- * - Use getConnection to fetch an available connection from the pool for database operations.
- * - After completing operations, return the connection to the pool using returnConnection.
- *
- * Thread Safety:
- * - The class uses std::mutex to ensure thread safety, making it suitable for use in multi-threaded environments.
- *
- * Exception Handling:
- * - Throws std::runtime_error if no connections are available when requested.
- *
- * @note It's important to ensure that connections are always returned to the pool after use to avoid resource leaks.
- */
-class MySqlConnectionPool
-{
-public:
-    /**
-     * @brief Constructs a connection pool with the specified size and database credentials.
-     * @param poolSize The number of connections to maintain in the pool.
-     * @param dbUri The URI of the database to connect to.
-     * @param user The username for database access.
-     * @param password The password for database access.
-     */
-    MySqlConnectionPool(int poolSize, const std::string& dbUri, const std::string& user, const std::string& password)
-        : poolSize(poolSize), dbUri(dbUri), user(user), password(password)
-    {
-        for (int i = 0; i < poolSize; ++i)
-        {
-            createConnection();
-        }
+//  * @class MySqlConnectionPool
+//  * @brief Manages a pool of connections to a MySQL database.
+//  *
+//  * MySqlConnectionPool implements a connection pool for MySQL connections. It maintains a specified number
+//  * of connections in a pool, allowing for efficient reuse across different parts of an application.
+//  * This class is designed to manage database connections in a way that avoids the overhead associated with
+//  * repeatedly opening and closing connections. It also handles invalid connections by replacing them with new ones.
+//  *
+//  * Usage:
+//  * - Create an instance of MySqlConnectionPool with the desired number of connections and database credentials.
+//  * - Use getConnection to fetch an available connection from the pool for database operations.
+//  * - After completing operations, return the connection to the pool using returnConnection.
+//  *
+//  * Thread Safety:
+//  * - The class uses std::mutex to ensure thread safety, making it suitable for use in multi-threaded environments.
+//  *
+//  * Exception Handling:
+//  * - Throws std::runtime_error if no connections are available when requested.
+//  *
+//  * @note It's important to ensure that connections are always returned to the pool after use to avoid resource leaks.
+//  */
+MySqlConnectionPool::MySqlConnectionPool(int poolSize, const std::string& dbUri, const std::string& user, const std::string& password)
+    : poolSize(poolSize), dbUri(dbUri), user(user), password(password) {
+    for (int i = 0; i < poolSize; ++i) {
+        createConnection();
     }
+}
 
-    ~MySqlConnectionPool()
-    {
-        // Release resources held by the connection pool
+MySqlConnectionPool::~MySqlConnectionPool() {
+    // Release resources held by the connection pool
         while (!connectionQueue.empty())
         {
             connectionQueue.pop(); // Clear the connection queue
         }
-        // No need to explicitly release mutex, std::mutex destructor takes care of it
-    }
+    // No need to explicitly release mutex, std::mutex destructor takes care of it
+}
 
-    /**
-     * @brief Fetches an available connection from the pool.
-     * @return A shared pointer to an available sql::Connection object.
-     * @throw std::runtime_error if no connections are available in the pool.
-     */
-    std::shared_ptr<sql::Connection> getConnection()
-    {
-        const int maxAttempts = 3;                                 // Maximum number of attempts to get a connection
+std::shared_ptr<sql::Connection> MySqlConnectionPool::getConnection() {
+     const int maxAttempts = 3;                                 // Maximum number of attempts to get a connection
         const std::chrono::milliseconds delayBetweenAttempts(100); // Delay between attempts
 
         std::unique_lock<std::mutex> lock(mutex);
@@ -154,13 +127,22 @@ public:
 
         // After all attempts, if no connection is available, throw an exception
         throw std::runtime_error("Failed to obtain a database connection after multiple attempts");
-    }
+}
 
-    /**
-     * @brief Returns a used connection back to the pool for future reuse.
-     * @param conn The connection to be returned to the pool.
-     */
-    void returnConnection(std::shared_ptr<sql::Connection> conn) {
+bool MySqlConnectionPool::isConnectionValid(std::shared_ptr<sql::Connection> conn) {
+     try
+        {
+            std::unique_ptr<sql::Statement> stmt(conn->createStatement());
+            std::unique_ptr<sql::ResultSet> res(stmt->executeQuery("SELECT 1"));
+            return res->next(); // Check if query executed successfully
+        }
+        catch (const sql::SQLException&)
+        {
+            return false; // Connection is not valid
+    }
+}
+
+void MySqlConnectionPool::returnConnection(std::shared_ptr<sql::Connection> conn) {
     std::unique_lock<std::mutex> lock(mutex);
     if (isConnectionValid(conn)) {
         connectionQueue.push(conn);
@@ -171,54 +153,21 @@ public:
             connectionQueue.push(newConn);
            }
         }
-    }
+}
 
-private:
-    /**
-     * @brief Checks if a connection is still valid.
-     * @param conn The database connection to check.
-     * @return True if the connection is valid, False otherwise.
-     */
-    bool isConnectionValid(std::shared_ptr<sql::Connection> conn)
-    {
-        try
-        {
-            std::unique_ptr<sql::Statement> stmt(conn->createStatement());
-            std::unique_ptr<sql::ResultSet> res(stmt->executeQuery("SELECT 1"));
-            return res->next(); // Check if query executed successfully
+void MySqlConnectionPool::createConnection() {
+    try {
+        auto conn = createNewConnection();
+        if (conn) {
+            connectionQueue.push(conn);
         }
-        catch (const sql::SQLException&)
-        {
-            return false; // Connection is not valid
-        }
+    } catch (const sql::SQLException& e) {
+        std::cerr << "Connection creation failed: " << e.what() << std::endl;
     }
-    /**
-     * @brief Creates and adds a new connection to the pool.pushes it inside the pool.
-     * This function is called during pool initialization and when replacing invalid connections.
-     */
-    void createConnection()
-    {
-        try
-        {
-            auto conn = createNewConnection();
-            if (conn)
-            {
-                connectionQueue.push(conn);
-            }
-        }
-        catch (const sql::SQLException& e)
-        {
-            std::cerr << "Connection creation failed: " << e.what() << std::endl;
-        }
-    }
+}
 
-    /**
-     * @brief Creates a new database connection.
-     * @return A shared pointer to a new sql::Connection object.
-     */
-    std::shared_ptr<sql::Connection> createNewConnection()
-    {
-        const int maxCreateAttempts = 3; // Maximum attempts to create a new connection
+std::shared_ptr<sql::Connection> MySqlConnectionPool::createNewConnection() {
+    const int maxCreateAttempts = 3; // Maximum attempts to create a new connection
         for (int attempt = 0; attempt < maxCreateAttempts; ++attempt)
         {
             try
@@ -242,22 +191,10 @@ private:
         }
         std::cerr << "Failed to create new connection after " << maxCreateAttempts << " attempts." << std::endl;
         return nullptr;
-    }
+}
 
-    std::queue<std::shared_ptr<sql::Connection>> connectionQueue; ///< Queue to manage the pool of connections.
-    std::mutex mutex;                                             ///< Mutex for thread safety.
-    int poolSize;                                                 ///< The size of the connection pool.
-    std::string dbUri;                                            ///< Database URI.
-    std::string user;                                             ///< Database username.
-    std::string password;                                         ///< Database password.
-};
-
-class MySqlConnectionManager
-{
-public:
-    MySqlConnectionManager(bool verbose, const std::string& configFile) : sVerbose(verbose)
-    {
-        try
+MySqlConnectionManager::MySqlConnectionManager(bool verbose, const std::string& configFile) : sVerbose(verbose) {
+    try
         {
             auto config = loadConfig(configFile);
 
@@ -282,33 +219,23 @@ public:
             std::cerr << "Initialization Error: " << e.what() << std::endl;
             throw; // Rethrow the exception to the caller
         }
-    }   
+}
 
-    ~MySqlConnectionManager()
-    {
-        pool.reset(); // Release the connection pool
-    }
+MySqlConnectionManager::~MySqlConnectionManager() {
+     pool.reset(); // Release the connection pool
+}
 
-    std::shared_ptr<sql::Connection> getConnection()
-    {
-        return pool->getConnection();
-    }
+std::shared_ptr<sql::Connection> MySqlConnectionManager::getConnection() {
+    return pool->getConnection();
+}
 
-    void returnConnection(std::shared_ptr<sql::Connection> conn)
-    {
-        pool->returnConnection(conn);
-    }
+void MySqlConnectionManager::returnConnection(std::shared_ptr<sql::Connection> conn) {
+    pool->returnConnection(conn);
+}
 
-private:
-    bool sVerbose;
-    std::unique_ptr<MySqlConnectionPool> pool; // Manage the connection pool
-
-    bool createTables()
-    {
-        // Your table creation logic here
-        return true;
-    }
-};
+bool MySqlConnectionManager::createTables() {
+    return true;
+}
 
 std::unique_ptr<MySqlConnectionManager> mysqlInit(bool verbose) {   
     try {
@@ -323,7 +250,7 @@ std::unique_ptr<MySqlConnectionManager> mysqlInit(bool verbose) {
         return nullptr; // Return nullptr to indicate failure
     }
 }
-//example code which is RAII compliant like the rest of the code.
+
 int getCompanyIDFromDevice(uint64_t deviceID, std::shared_ptr<sql::Connection> conn)
 {
     int companyID = 0; // Default value if no results are found
@@ -369,7 +296,6 @@ int getCompanyIDFromDevice(uint64_t deviceID, std::shared_ptr<sql::Connection> c
     return companyID; // Return 0 if no entry is found or the retrieved Company ID
 }
 
-
 std::string getCurrentTimeAsString()
 {
     auto now = std::chrono::system_clock::now();
@@ -381,7 +307,7 @@ std::string getCurrentTimeAsString()
     oss << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S");
     return oss.str();
 }
-//example code number 2
+
 BatchInfo getStructBatchCodesByCurrentDate(int companyId, std::shared_ptr<sql::Connection> conn)
 {
     BatchInfo batchInfo;
@@ -427,5 +353,78 @@ BatchInfo getStructBatchCodesByCurrentDate(int companyId, std::shared_ptr<sql::C
     }
 
     return batchInfo;
+}
+
+// handleRawDataPushRequest
+bool mysqlUpdateDataRequired(uint64_t idDevice, uint32_t idMeasurement, int32_t rawDatasetRequired, std::shared_ptr<sql::Connection> conn)
+{
+    try
+    {
+        // Create a prepared statement using RAII
+        std::unique_ptr<sql::PreparedStatement> pstmt(
+            conn->prepareStatement(
+                "UPDATE `datasets` SET `raw_dataset_required` = ? WHERE `id_device` = ? AND `id_measurement` = ?"));
+
+        pstmt->setInt(1, rawDatasetRequired);
+        pstmt->setUInt64(2, idDevice);
+        pstmt->setUInt(3, idMeasurement);
+
+        pstmt->executeUpdate();
+
+        return true;
+    }
+    catch (const sql::SQLException &e)
+    {
+        std::cerr << "MySQL Error: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+// handleRawDataRequiredRequest
+uint32_t mysqlGetDataRequired(uint64_t idDevice, std::shared_ptr<sql::Connection> conn)
+{
+    try
+    {
+        std::string query =
+            "SELECT `id_measurement` FROM `datasets` "
+            "WHERE `id_device` = ? AND `raw_dataset_required` > 0 "
+            "AND `id_measurement` NOT IN "
+            "(SELECT `id_measurement` FROM `raw_datasets` WHERE `id_device` = ?)";
+
+        // Create a prepared statement using RAII
+        std::unique_ptr<sql::PreparedStatement> pstmt(
+            conn->prepareStatement(query));
+
+        pstmt->setUInt64(1, idDevice);
+        pstmt->setUInt64(2, idDevice);
+
+        // Execute the query and manage the result set using RAII
+        std::unique_ptr<sql::ResultSet> result(pstmt->executeQuery());
+
+        uint32_t value = 0;
+        if (result->next())
+        {
+            value = result->getUInt(1);
+
+            if (true)
+            {
+                std::cout << "Executed " << query << " with result " << value << std::endl;
+            }
+        }
+        else
+        {
+            if (true)
+            {
+                std::cout << "Executed " << query << " with empty result set" << std::endl;
+            }
+        }
+
+        return value;
+    }
+    catch (const sql::SQLException &e)
+    {
+        std::cerr << "MySQL Error: " << e.what() << std::endl;
+        return 0; // Return 0 to indicate an error
+    }
 }
 
