@@ -10,12 +10,18 @@
 #include <fcntl.h>
 #include <sstream>
 #include <filesystem>
+#include <stdexcept>
+#include <fstream>
 
-#include "server.h"
+#include "amilink/amilink.h"
+#include "plf/plf.h"
+#include "mqs/mqs.h"
+#include "aminicserver.h"
 #include "mysql.h"
 
-#include <sys/epoll.h>
-
+// include the file library in your makefile.
+#include <nlohmann/json.hpp>
+#include <fcntl.h> // For the O_NONBLOCK flag
 
 //--------------------Local defines  -------------------------------------------------------
 
@@ -23,59 +29,606 @@
 
 static int sLink = -1;
 static bool sVerbose = false;
+static std::atomic<int32_t> connectionId(0); // Global atomic counter for connection IDs
+static bool isAlgorithmNeeded = false;
 
-struct ThreadData {
-    int connection; // Connection identifier or file descriptor
-    std::shared_ptr<MySqlConnectionManager> mysqlManager; // Shared pointer for thread safety and RAII
-};
+Server *globalServer = nullptr;
 
-//Implementations of HandleCase1-8... and various helper functions. 
+//--------------------Forward declarations of functions -------------------------------------
+
+//--------------------Local functions -------------------------------------------------------
+
+static bool checkAssemblyBuffer(const MqsCldFile_t &block, void *&rawDataSetAssemblyBuffer, uint32_t &maxAssemblyLength)
+{
+    uint32_t offset = block.offset;
+    uint32_t length = block.length;
+    uint32_t totalLength = block.totalLength;
+    bool ok = false;
+    if ((offset + length <= totalLength)) // 0 gelirse de buraya giriyoruz code.
+    {
+        if (offset == 0) // gelen very 0 da olabilir
+        {
+            if (length >= sizeof(MqsRawDataSet_t))
+            {
+                const MqsRawDataSet_t *pRawDataSet = (MqsRawDataSet_t *)&(block.data);
+                uint32_t dataCount = pRawDataSet->base.dataCount + pRawDataSet->afterExposure.dataCount;
+                uint32_t maxLength = sizeof(MqsRawDataSet_t) + dataCount * sizeof(MqsRawDataPoint_t);
+                if (totalLength == maxLength)
+                {
+                    ok = true;
+                    rawDataSetAssemblyBuffer = realloc(rawDataSetAssemblyBuffer, maxLength);
+                    maxAssemblyLength = maxLength;
+                    if (sVerbose)
+                    {
+                        printf("Allocated buffer for rawDataSet_t of %d bytes\n", maxAssemblyLength);
+                    }
+                }
+                else
+                {
+                    fprintf(stderr, "Error, Raw data length mismatch, totalLength=%d, maxLength=%d\n", totalLength, maxLength);
+                }
+            }
+            else
+            {
+                fprintf(stderr, "Error, Raw data to short, length=%d\n", length);
+            }
+        }
+        else
+        {
+            if (totalLength == maxAssemblyLength)
+            {
+                ok = true;
+            }
+            else
+            {
+                fprintf(stderr, "Error, Total length must not change during transfer, totalLength=%d, maxAssemblyLength=%d\n", totalLength, maxAssemblyLength);
+            }
+        }
+    }
+    else
+    {
+        fprintf(stderr, "Error, Raw data to long, offset=%d, length=%d, totalLength=%d", offset, length, totalLength);
+    }
+    return ok;
+}
+
+static bool hasPostfix(std::string const &fullString, std::string const &postfix)
+{
+    int32_t postfixSize = postfix.size();
+    int32_t fullStringSize = fullString.size();
+    if (fullStringSize >= postfixSize)
+    {
+        return (0 == fullString.compare(fullStringSize - postfixSize, postfixSize, postfix));
+    }
+    else
+    {
+        return false;
+    }
+}
+
+static bool hasPrefix(std::string const &fullString, std::string const &prefix)
+{
+    return fullString.compare(0, prefix.size(), prefix) == 0;
+}
+
+static uint32_t getFileVersion(std::string prefix, std::string postfix)
+{
+    DIR *dir;
+    struct dirent *ent;
+    uint32_t versionNumber = 0;
+    if (sVerbose)
+    {
+        std::cout << "Searching version with prefix '" << prefix << "' and postfix '" << postfix << "'" << std::endl;
+    }
+    if ((dir = opendir(FILE_LIBRARY)) != NULL)
+    {
+        while ((ent = readdir(dir)) != NULL)
+        {
+            std::string filename(ent->d_name);
+            bool match = hasPrefix(filename, prefix) && hasPostfix(filename, postfix);
+            if (match)
+            {
+                std::string version = filename.substr(0, filename.size() - postfix.size()).substr(prefix.size());
+                try
+                {
+                    // converts String into integer.
+                    versionNumber = std::stoi(version, nullptr, 10);
+                }
+                catch (...)
+                {
+                    // nothing
+                }
+                if (sVerbose)
+                {
+                    std::cout << "Match <" << versionNumber << "> in " << filename << std::endl;
+                }
+            }
+        }
+        closedir(dir);
+    }
+    else
+    {
+        perror("Error with listing files");
+    }
+    return versionNumber;
+}
+
+static void handleDataLogPushRequest(int efd, int connection, uint64_t &idDevice, MqsCldMsg_t &request, std::shared_ptr<sql::Connection> conn)
+{
+    MqsDataSet_t dataSet = request.dataLogPushReq;
+    mysqlInsertDataSet(idDevice, dataSet, conn);
+    MqsCldMsg_t response = {.topic = MQS_DATA_LOG_PUSH_RESPONSE};
+
+    // Set connection to EPOLLOUT before sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLOUT | EPOLLET);
+    amilinkSendMessage(connection, response);
+
+    // Set connection back to EPOLLIN after sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLIN | EPOLLET);
+}
 
 
-static bool handleRequest(int connection, uint64_t& idDevice, MqsCldMsg_t& request, void*& rawDataSetAssemblyBuffer, uint32_t& maxAssemblyLength, std::shared_ptr<sql::Connection> conn)
+static void handleRawDataPushRequest(int efd, int connection, uint64_t &idDevice, MqsCldMsg_t &request, void *&rawDataSetAssemblyBuffer, uint32_t &maxAssemblyLength, std::shared_ptr<sql::Connection> conn)
+{
+    MqsCldFile_t block = request.rawDataPushReq;
+
+    if (checkAssemblyBuffer(block, rawDataSetAssemblyBuffer, maxAssemblyLength))
+    {
+        uint32_t offset = block.offset;
+        uint32_t length = block.length;
+        uint32_t totalLength = block.totalLength;
+        memcpy(((char *)rawDataSetAssemblyBuffer) + offset, block.data, block.length);
+        if (offset + length == totalLength)
+        {
+            MqsRawDataSet_t *pRawDataSet = (MqsRawDataSet_t *)rawDataSetAssemblyBuffer;
+            mysqlInsertRawDataSet(idDevice, *pRawDataSet, conn);
+            mysqlUpdateDataRequired(idDevice, pRawDataSet->idMeasurement, 0, conn);
+            MqsCldMsg_t response = {.topic = MQS_RAW_DATA_PUSH_RESPONSE};
+
+            // Set connection to EPOLLOUT before sending
+            globalServer->modifyEpollEvent(efd, connection, EPOLLOUT | EPOLLET);
+            amilinkSendMessage(connection, response);
+
+            // Set connection back to EPOLLIN after sending
+            globalServer->modifyEpollEvent(efd, connection, EPOLLIN | EPOLLET);
+
+            free(rawDataSetAssemblyBuffer);
+            rawDataSetAssemblyBuffer = nullptr;
+            maxAssemblyLength = 0;
+        }
+    }
+}
+
+static void handleRawDataRequiredRequest(int efd, int connection, uint64_t &idDevice, MqsCldMsg_t &request, std::shared_ptr<sql::Connection> conn)
+{
+    MqsCldMsg_t response = {.topic = MQS_RAW_DATA_REQUIRED_RESPONSE};
+    response.rawDataRequiredResp.idMeasurement = mysqlGetDataRequired(idDevice, conn);
+
+    // Set connection to EPOLLOUT before sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLOUT | EPOLLET);
+    amilinkSendMessage(connection, response);
+
+    // Set connection back to EPOLLIN after sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLIN | EPOLLET);
+}
+
+static void handleDataFetchRequest(int efd, int connection, uint64_t &idDevice, MqsCldMsg_t &request, std::shared_ptr<sql::Connection> conn)
+{
+    MqsCldMsg_t response = {.topic = MQS_FETCH_TEST_RESPONSE};
+    BatchInfo batchInfobuffer = {std::vector<BatchCodeInfo>(), 0};
+
+    int companyID = getCompanyIDFromDevice(idDevice, conn);
+
+    // Use getStructBatchCodesByConditions to populate the response
+    if (companyID == 0)
+    {
+        // No need to do anything as batchInfobuffer is already initialized to zeros
+    }
+    else
+    {
+        batchInfobuffer = getStructBatchCodesByCurrentDate(companyID, conn);
+    }
+
+    if (batchInfobuffer.totalCount == 0)
+    {
+        for (int i = 0; i < 5; i++)
+        {
+            strcpy(response.testFetchResp.batchStruct[i].batchNumber, "");
+            response.testFetchResp.batchStruct[i].batch_uid = 0;
+            response.testFetchResp.batchStruct[i].meat_type = 0;
+        }
+    }
+    else
+    {
+        // Copy batchID directly without conversion
+        for (int i = 0; i < batchInfobuffer.totalCount; i++)
+        {
+            strncpy(response.testFetchResp.batchStruct[i].batchNumber, batchInfobuffer.batchCodes[i].batchID, sizeof(response.testFetchResp.batchStruct[i].batchNumber));
+            response.testFetchResp.batchStruct[i].meat_type = batchInfobuffer.batchCodes[i].meat_type;
+            response.testFetchResp.batchStruct[i].batch_uid = batchInfobuffer.batchCodes[i].batch_uid;
+        }
+    }
+
+    response.testFetchResp.count = batchInfobuffer.totalCount;
+
+    // Set connection to EPOLLOUT before sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLOUT | EPOLLET);
+    amilinkSendMessage(connection, response);
+
+    // Set connection back to EPOLLIN after sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLIN | EPOLLET);
+}
+
+static void handleDeviceRegistrationRequest(int efd, int connection, uint64_t &idDevice, MqsCldMsg_t &request)
+{
+    idDevice = request.deviceRegisterReq.idDevice;
+    MqsCldMsg_t response = {.topic = MQS_DEVICE_REGISTER_RESPONSE};
+
+    // Set connection to EPOLLOUT before sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLOUT | EPOLLET);
+    amilinkSendMessage(connection, response);
+
+    // Set connection back to EPOLLIN after sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLIN | EPOLLET);
+}
+
+static void fileErrorResponse(int efd, int connection)
+{
+    if (sVerbose)
+    {
+        printf("Sending 'zero' file response\n");
+    }
+    MqsCldMsg_t response = {.topic = MQS_FILE_RESPONSE};
+    response.filePullResp.length = 0;
+    response.filePullResp.offset = 0;
+    response.filePullResp.totalLength = 0;
+
+    // Set connection to EPOLLOUT before sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLOUT | EPOLLET);
+    amilinkSendMessage(connection, response);
+
+    // Set connection back to EPOLLIN after sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLIN | EPOLLET);
+}
+
+static uint32_t getAlgoVersion(const std::string &prefix, const std::string &postfix)
+{ // pointer passed in. this should be checked carefully.
+    DIR *dir;
+    struct dirent *ent;
+    uint32_t versionNumber = 0;
+
+    if (true)
+    { //(sVerbose)
+        std::cout << "Searching version with prefix '" << prefix << "' and postfix '" << postfix << "'" << std::endl;
+    }
+
+    if ((dir = opendir(FILE_LIBRARY)) != NULL)
+    { // dogru
+        while ((ent = readdir(dir)) != NULL)
+        {                                      // dogru
+            std::string filename(ent->d_name); // dogru
+            if (hasPrefix(filename, prefix) && hasPostfix(filename, postfix))
+            { // boolean true. dogru bu da kullanilyor.
+                // Construct full file path
+                std::string fullPath = std::string(FILE_LIBRARY) + filename;
+
+                std::ifstream fileStream(fullPath);
+                if (!fileStream.is_open())
+                {
+                    std::cerr << "Cannot open file " << fullPath << std::endl;
+                    continue;
+                }
+
+                try
+                {
+                    nlohmann::json jsonFile;
+                    fileStream >> jsonFile; // Read the JSON file
+                    fileStream.close();
+
+                    // Extract versionNumber from the algorithm section if it exists
+                    if (jsonFile.contains("algorithm") && jsonFile["algorithm"].contains("versionNumber"))
+                    {
+                        versionNumber = jsonFile["algorithm"]["versionNumber"].get<uint32_t>();
+                        std::cout << "Algo Version Number: " << versionNumber << std::endl;
+                    }
+
+                    if (sVerbose)
+                    {
+                        std::cout << "Match <" << versionNumber << "> in " << filename << std::endl;
+                    }
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "Error processing file " << filename << ": " << e.what() << std::endl;
+                }
+            }
+        }
+        closedir(dir);
+    }
+    else
+    {
+        perror("Error with listing files");
+    }
+
+    return versionNumber;
+}
+
+
+static void handleVersionRequest(int efd, int connection, MqsCldMsg_t &request)
+{
+    MqsCldMsg_t response = {.topic = MQS_VERSION_RESPONSE};
+    std::string prefix(request.versionReq.versionPrefix);
+    std::string postfix(request.versionReq.versionPostfix);
+
+    if (postfix == ".algo")
+    {
+        response.versionResp.version = getAlgoVersion(prefix, postfix);
+        if (response.versionResp.version != request.versionReq.algoVersion)
+        {
+            std::cout << "incoming algo Version from the other side " << request.versionReq.algoVersion << std::endl;
+            isAlgorithmNeeded = true;
+        }
+    }
+    else
+    {
+        std::cout << "dfu versionCheck activated. " << std::endl;
+        response.versionResp.version = getFileVersion(prefix, postfix);
+    }
+    std::cout << "sent Version " << response.versionResp.version << std::endl;
+
+    // Set connection to EPOLLOUT before sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLOUT | EPOLLET);
+    amilinkSendMessage(connection, response);
+
+    // Set connection back to EPOLLIN after sending
+    globalServer->modifyEpollEvent(efd, connection, EPOLLIN | EPOLLET);
+}
+
+static void handleAlgoRequest(int efd, int connection, MqsCldMsg_t &request, uint64_t &idDevice, std::shared_ptr<sql::Connection> conn)
+{
+    int companyID = getCompanyIDFromDevice(idDevice, conn);
+    std::vector<int> requestedIds = getUniqueMeatTypesForCompany(companyID, conn);
+    std::cout << "Requested Meat Type IDs for Company ID " << companyID << ": ";
+    for (const int id : requestedIds)
+    {
+        std::cout << id << " ";
+    }
+    std::cout << std::endl;
+
+    std::string filename(request.filePullReq.filename);
+    std::string path = std::string(FILE_LIBRARY) + filename;
+
+    if (true) 
+    {
+        std::cout << "Request for file " << filename << " with company ID " << companyID << std::endl;
+    }
+    try
+    {
+        std::ifstream fileStream(path);
+        if (!fileStream.is_open())
+        {
+            throw std::runtime_error("Cannot open file " + path);
+        }
+
+        nlohmann::json originalJson;
+        fileStream >> originalJson;
+        fileStream.close();
+
+        nlohmann::json jsonToSend;
+
+        if (isAlgorithmNeeded)
+        {
+            jsonToSend["algorithm"] = originalJson["algorithm"];
+            isAlgorithmNeeded = false;
+        }
+
+        nlohmann::json filteredMeatTypes;
+        uint16_t count = 0;
+        for (const auto &meatType : originalJson["meat_types"])
+        {
+            if (std::find(requestedIds.begin(), requestedIds.end(), meatType["id"].get<int>()) != requestedIds.end())
+            {
+                nlohmann::json newMeatType = {
+                    {"id", meatType["id"]},
+                    {"cubic", meatType["cubic"]},
+                    {"quadratic", meatType["quadratic"]},
+                    {"linear", meatType["linear"]},
+                    {"adjConstant", meatType["adjConstant"]},
+                    {"max_days", meatType["max_days"]}};
+                filteredMeatTypes.push_back(newMeatType);
+                count++;
+                if (count >= 5)
+                {
+                    break;
+                }
+            }
+        }
+
+        jsonToSend["meat_types"] = filteredMeatTypes;
+        std::string updatedJson = jsonToSend.dump();
+        size_t remain = updatedJson.size();
+        size_t offset = 0;
+        MqsCldMsg_t response = {};
+        response.topic = MQS_FILE_RESPONSE;
+
+        while (remain > 0)
+        {
+            size_t chunkSize = std::min(remain, static_cast<size_t>(MQS_CLD_DATA_PAYLOAD_MAX));
+            std::memcpy(response.filePullResp.data, updatedJson.data() + offset, chunkSize);
+
+            if (sVerbose)
+            {
+                printf("File push remain=%zu, offset=%zu, readSize=%zu\n", remain, offset, chunkSize);
+            }
+
+            response.filePullResp.length = chunkSize;
+            response.filePullResp.offset = offset;
+            response.filePullResp.totalLength = updatedJson.size();
+
+            // Set connection to EPOLLOUT before sending
+            globalServer->modifyEpollEvent(efd, connection, EPOLLOUT | EPOLLET);
+            int32_t dataSent = amilinkSendMessage(connection, response);
+
+            if (dataSent <= 0)
+            {
+                fprintf(stderr, "Error sending file %s\n", filename.c_str());
+                fileErrorResponse(efd, connection);
+                return;
+            }
+
+            remain -= chunkSize;
+            offset += chunkSize;
+
+            // Set connection back to EPOLLIN after sending each chunk
+            globalServer->modifyEpollEvent(efd, connection, EPOLLIN | EPOLLET);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Error processing file request: " << e.what() << std::endl;
+        fileErrorResponse(efd, connection); // Error handling
+    }
+}
+
+static void handleFirmwareRequest(int efd, int connection, MqsCldMsg_t &request)
+{
+    std::string filename(request.filePullReq.filename);
+    std::string path = std::string(FILE_LIBRARY) + filename;
+    if (sVerbose)
+    {
+        std::cout << "Request for file " << filename << std::endl;
+    }
+    bool ok = true;
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0)
+    {
+        fprintf(stderr, "Error opening file %s, %d %s\n", filename.c_str(), errno, strerror(errno));
+        ok = false;
+    }
+    else
+    {
+        int32_t totalLength = lseek(fd, 0, SEEK_END);
+        if (totalLength < 0)
+        {
+            fprintf(stderr, "Error seeking in file %s, %d %s\n", filename.c_str(), errno, strerror(errno));
+            ok = false;
+        }
+        else
+        {
+            int32_t status = lseek(fd, 0, SEEK_SET);
+            if (status < 0)
+            {
+                fprintf(stderr, "Error seeking in file %s, %d %s\n", filename.c_str(), errno, strerror(errno));
+                ok = false;
+            }
+            else
+            {
+                uint32_t remain = totalLength;
+                uint32_t offset = 0;
+                MqsCldMsg_t response = {.topic = MQS_FILE_RESPONSE};
+
+                while (remain > 0 && ok)
+                {
+                    uint32_t readSize = read(fd, response.filePullResp.data, MQS_CLD_DATA_PAYLOAD_MAX);
+                    if (sVerbose)
+                    {
+                        printf("file push remain=%d, offset=%d, readsize=%d\n", remain, offset, readSize);
+                    }
+                    if (readSize > 0)
+                    {
+                        response.filePullResp.length = readSize;
+                        response.filePullResp.offset = offset;
+                        response.filePullResp.totalLength = totalLength;
+                        remain -= readSize;
+                        offset += readSize;
+
+                        // Set connection to EPOLLOUT before sending
+                        globalServer->modifyEpollEvent(efd, connection, EPOLLOUT | EPOLLET);
+                        int32_t dataSent = amilinkSendMessage(connection, response);
+                        ok = dataSent > 0;
+
+                        // Set connection back to EPOLLIN after sending each chunk
+                        globalServer->modifyEpollEvent(efd, connection, EPOLLIN | EPOLLET);
+                    }
+                    else
+                    {
+                        ok = false;
+                        fprintf(stderr, "Error reading file %s, %d %s\n", filename.c_str(), errno, strerror(errno));
+                    }
+                }
+            }
+        }
+        close(fd);
+    }
+    if (!ok)
+    {
+        fileErrorResponse(efd, connection);
+    }
+}
+
+static void handleFileRequest(int efd, int connection, MqsCldMsg_t &request, uint64_t &idDevice, std::shared_ptr<sql::Connection> conn)
+{
+    std::string filename(request.filePullReq.filename);
+
+    if (filename.length() > 5)
+    {
+        if (filename.substr(filename.length() - 5) == ".algo")
+        {
+            std::cout << "handle Algo Request. " << std::endl;
+            handleAlgoRequest(efd, connection, request, idDevice, conn);
+        }
+        else if (filename.substr(filename.length() - 4) == ".dfu")
+        {
+            std::cout << "handle File Request. " << std::endl;
+            handleFirmwareRequest(efd, connection, request);
+        }
+        else
+        {
+            std::cout << "Unsupported file type: " << filename << std::endl;
+        }
+    }
+    else
+    {
+        std::cout << "Filename too short to determine request type: " << filename << std::endl;
+    }
+}
+
+static bool handleRequest(int efd, int connection, uint64_t &idDevice, MqsCldMsg_t &request, void *&rawDataSetAssemblyBuffer, uint32_t &maxAssemblyLength, std::shared_ptr<sql::Connection> conn)
 {
     bool more = true;
     MqsCldTopic_t topic = static_cast<MqsCldTopic_t>(request.topic);
     if (sVerbose)
-    {   
-        printf("Processing request %d\n", topic);
+    {
+        printf("Got request %d\n", topic);
     }
     switch (topic)
     {
-    case CASE1:
-        // Corresponding operation for CASE1
-        handleCase1(connection, idDevice, request, conn);
+    case MQS_DATA_LOG_PUSH_REQUEST:
+        handleDataLogPushRequest(efd, connection, idDevice, request, conn);
         break;
-    case CASE2:
-        // Corresponding operation for CASE2
-        handleCase2(connection, idDevice, request);
+    case MQS_DEVICE_REGISTER_REQUEST:
+        handleDeviceRegistrationRequest(efd, connection, idDevice, request);
         break;
-    case CASE3:
-        // Corresponding operation for CASE3
-        handleCase3(connection, request);
+    case MQS_FILE_REQUEST:
+        handleFileRequest(efd, connection, request, idDevice, conn);
         break;
-    case CASE4:
-        // Corresponding operation for CASE4
+    case MQS_GOODBYE_REQUEST:
         more = false;
         break;
-    case CASE5:
-        // Corresponding operation for CASE5
-        handleCase5(connection, idDevice, request, rawDataSetAssemblyBuffer, maxAssemblyLength, conn);
+    case MQS_RAW_DATA_PUSH_REQUEST:
+        handleRawDataPushRequest(efd, connection, idDevice, request, rawDataSetAssemblyBuffer, maxAssemblyLength, conn);
         break;
-    case CASE6:
-        // Corresponding operation for CASE6
-        handleCase6(connection, idDevice, request, conn);
+    case MQS_RAW_DATA_REQUIRED_REQUEST:
+        handleRawDataRequiredRequest(efd, connection, idDevice, request, conn);
         break;
-    case CASE7:
-        // Corresponding operation for CASE7
-        handleCase7(connection, request);
+    case MQS_VERSION_REQUEST:
+        handleVersionRequest(efd, connection, request);
         break;
-    case CASE8:
-        // Corresponding operation for CASE8
-        handleCase8(connection, idDevice, request, conn);
+    case MQS_FETCH_TEST_REQUEST:
+        handleDataFetchRequest(efd, connection, idDevice, request, conn);
         break;
     default:
-        fprintf(stderr, "Error: Unhandled request type %d\n", topic);
+        fprintf(stderr, "Error: No handling of topic %d\n", topic);
         break;
     }
     return more;
@@ -110,336 +663,205 @@ struct ThreadData
  */
 static void *connectionHandler(void *pData)
 {
-    static int32_t connectionId = 0;
-    // Change: No need for unique_ptr here if passed as shared_ptr, but assuming this is simplified:
     auto data = static_cast<ThreadData *>(pData); // Direct use if passing raw but better to pass smart pointers directly
     int connection = data->connection;
 
     uint64_t idDevice = 0;
-    connectionId++;
-    int32_t _connectionId = connectionId;
+    int32_t localConnectionId = connectionId.fetch_add(1, std::memory_order_relaxed);
+
     bool more = true;
     if (sVerbose)
     {
-        std::cout << "New connection " << _connectionId << std::endl;
+        std::cout << "New connection " << localConnectionId << std::endl;
     }
     int32_t msgCount = 0;
     void *rawDataSetAssemblyBuffer = nullptr;
     uint32_t maxAssemblyLength = 0;
     time_t lastMessage = time(nullptr);
     auto conn = data->mysqlManager->getConnection();
+
     while (more)
     {
         msgCount++;
         MqsCldMsg_t request;
         if (sVerbose)
         {
-            std::cout << "Waiting for message " << msgCount << " on connection " << _connectionId << std::endl;
+            std::cout << "Waiting for message " << msgCount << " on connection " << localConnectionId << std::endl;
         }
-        int32_t messageLength = amilinkReadMessage(connection, request);
-        if (messageLength > 0)
+
+        // Wait for events on this connection
+        struct epoll_event event;
+        int n = epoll_wait(globalServer->efd, &event, 1, -1);
+
+        if (n > 0 && event.data.fd == connection)
         {
-            more = handleRequest(connection, idDevice, request, rawDataSetAssemblyBuffer, maxAssemblyLength, conn);
-            time(&lastMessage);
-        }
-        else
-        {
-            time_t now = time(nullptr);
-            bool activity = (lastMessage + MAX_INACTIVITY) > now;
-            more = activity && amilinkHeartbeat(connection);
+            int32_t messageLength = amilinkReadMessage(connection, request);
+            if (messageLength > 0)
+            {
+                more = handleRequest(globalServer->efd, connection, idDevice, request, rawDataSetAssemblyBuffer, maxAssemblyLength, conn);
+                time(&lastMessage);
+            }
+            else
+            {
+                time_t now = time(nullptr);
+                bool activity = (lastMessage + MAX_INACTIVITY) > now;
+                more = activity && amilinkHeartbeat(connection);
+            }
         }
     }
+    // Cleanup epoll instance for this connection
+    epoll_ctl(globalServer->efd, EPOLL_CTL_DEL, connection, nullptr);
+
     data->mysqlManager->returnConnection(conn);
     amilinkClose(connection);
     if (sVerbose)
     {
-        std::cout << "Terminating connection " << _connectionId << std::endl;
+        std::cout << "Terminating connection " << localConnectionId << std::endl;
     }
     return NULL;
 }
 
-/**
- * @brief Initializes and starts the server, including setting up the MySQL connection manager.
- *
- * This function configures the server based on the specified port and verbosity settings. It initializes
- * the MySQL connection manager with provided configuration details and then creates a server instance
- * to listen for incoming connections. The server's lifecycle is managed via a unique_ptr, ensuring
- * automatic cleanup upon termination or exception. The MySQL connection manager is shared among threads
- * created by the server to handle client connections, ensuring efficient database operations.
- *
- * @param port The port number on which the server will listen for incoming connections.
- * @param verbose A boolean flag indicating whether verbose logging should be enabled.
- *
- * @note The function prepares the listening socket, initializes the MySQL connection manager, and starts
- *       the server thread. It demonstrates the use of modern C++ practices such as smart pointers for
- *       resource management and std::thread for multithreading. The MySQL connection manager is initialized
- *       with a configuration file path, and its lifetime is managed by shared_ptr, guaranteeing that it remains
- *       available as long as the server is running. The server itself is encapsulated in a unique_ptr, ensuring
- *       that it is properly destroyed when the application exits or if serverInit is called again after stopping
- *       the server. This function embodies the RAII (Resource Acquisition Is Initialization) principle, making
- *       resource management automatic and exception-safe.
- *
- * Usage example:
- * @code
- *   uint16_t port = 8080;
- *   bool verbose = true;
- *   serverInit(port, verbose);
- * @endcode
- *
- * After calling this function, the server is actively listening on the specified port and ready to handle
- * incoming connections. The server will use the MySQL connection manager for database interactions, sharing
- * this resource among all connection handler threads.
- */
-class Server
+Server::Server(uint16_t port, bool verbose, std::shared_ptr<MySqlConnectionManager> mysqlManager)
+    : sPort(port), sVerbose(verbose), running(false), mysqlManager(mysqlManager), efd(-1), threadPool(10), activeConnections(0) // Initialize with 10 threads
 {
-public:
-    /**
-     * @brief Constructor for the Server class.
-     * @param port Port number on which the server will listen for incoming connections.
-     * @param verbose Flag indicating whether to log detailed operational messages.
-     * @param mysqlManager Shared pointer to an initialized MySqlConnectionManager for handling database operations.
-     */
-    Server(uint16_t port, bool verbose, std::shared_ptr<MySqlConnectionManager> mysqlManager)
-        : sPort(port), sVerbose(verbose), mysqlManager(mysqlManager), running(false), efd(-1) {}
+    // Constructor body, if needed
+}
 
-    /**
-     * @brief Destructor for the Server class.
-     *
-     * Cleans up resources used by the server, including closing the epoll file descriptor and the listening socket.
-     */
-    ~Server()
-    {
-        if (efd >= 0)
-            close(efd);
-        // if (sLink >= 0) close(sLink);
+Server::~Server() {
+    stop();
+    if (efd >= 0)
+        close(efd);
+    if (sLink >= 0)
+        close(sLink);
+}
+
+bool Server::initialize() {
+    sLink = amilinkListen(sPort);
+    if (sLink < 0) {
+        perror("amilinkListen");
+        return false;
     }
 
-    /**
-     * @brief Initializes the server's listening socket and epoll instance.
-     *
-     * Sets up the listening socket for non-blocking I/O and registers it with the epoll instance to monitor
-     * for incoming connection events.
-     *
-     * @return True if initialization was successful, false otherwise.
-     */
-    bool initialize()
-    {
-        /**
-         * @brief Configures the server's listening socket for non-blocking I/O and registers it with an epoll instance.
-         *
-         * This function performs the following steps:
-         * 1. Retrieves the current file status flags of the listening socket (sLink) using the F_GETFL command.
-         * 2. Checks if the retrieval was successful. If not, returns false indicating failure.
-         * 3. Sets the file descriptor to non-blocking mode by combining the current flags with O_NONBLOCK
-         *    using bitwise OR and applying them with the F_SETFL command.
-         * 4. Checks if setting the non-blocking mode was successful. If not, returns false indicating failure.
-         * 5. Creates an epoll instance for monitoring I/O events and stores the file descriptor of the new
-         *    instance in 'efd'.
-         * 6. Initializes an epoll_event structure to specify the interest in read events (EPOLLIN) for the
-         *    listening socket.
-         * 7. Registers the listening socket with the epoll instance using epoll_ctl with the EPOLL_CTL_ADD command,
-         *    to start monitoring for incoming connections.
-         *
-         * @return True if the listening socket was successfully set to non-blocking mode and registered with the epoll instance,
-         *         false otherwise.
-         *
-         * @note This setup allows the server to handle multiple client connections efficiently in a non-blocking manner,
-         *       using the epoll mechanism to get notified about I/O events without blocking the main thread.
-         */
-        // Example for setting non-blocking mode
-        int flags = fcntl(sLink, F_GETFL, 0);
-        if (flags == -1)
-            return false;
-        if (fcntl(sLink, F_SETFL, flags | O_NONBLOCK) == -1)
-            return false;
+    int flags = fcntl(sLink, F_GETFL, 0);
+    if (flags == -1)
+        return false;
+    if (fcntl(sLink, F_SETFL, flags | O_NONBLOCK) == -1)
+        return false;
 
-        efd = epoll_create1(0);
-        if (efd == -1)
-            return false;
+    efd = epoll_create1(0);
+    if (efd == -1)
+        return false;
 
-        struct epoll_event event;
-        event.data.fd = sLink;
-        event.events = EPOLLIN; // Interested in read events
-        if (epoll_ctl(efd, EPOLL_CTL_ADD, sLink, &event) == -1)
-            return false;
+    struct epoll_event event;
+    event.data.fd = sLink;
+    event.events = EPOLLIN; // Interested in read events
+    if (epoll_ctl(efd, EPOLL_CTL_ADD, sLink, &event) == -1)
+        return false;
 
-        return true;
+    return true;
+}
+
+void Server::start() {
+    if (!initialize()) {
+        std::cerr << "Server initialization failed\n";
+        return;
     }
+    running = true;
+    mainThread = std::thread(&Server::run, this);
+}
 
-    /**
-     * @brief Starts the server's main loop in a separate thread.
-     *
-     * Initiates the asynchronous server operation, including listening for new connections
-     * and dispatching client requests to handler threads.
-     */
-    void start()
-    {
-        if (!initialize())
-        {
-            std::cerr << "Server initialization failed\n";
-            return;
-        }
-        running = true;
-        mainThread = std::thread(&Server::run, this);
+void Server::stop() {
+    running = false;
+    if (mainThread.joinable()) {
+        mainThread.join();
     }
+    threadPool.shutdown(); // Shutdown the thread pool
+}
 
-    /**
-     * @brief Stops the server's main loop and cleans up resources.
-     *
-     * Signals the server loop to stop and waits for the main thread and any active connection handler threads to join.
-     */
-    void stop()
-    {
-        running = false;
-        if (mainThread.joinable())
-        {
-            mainThread.join();
-        }
-    }
+void Server::run() {
+    const int MAX_EVENTS = 10;
+    struct epoll_event events[MAX_EVENTS]; // Buffer where events are returned
 
-    /**
-     * @brief Cleans up finished connection handler threads.
-     *
-     * Iterates through the list of active connection handler threads and removes any that have completed their execution.
-     */
-    void cleanUpFinishedThreads()
-    {
-        for (auto it = connectionThreads.begin(); it != connectionThreads.end();)
-        {
-            if (!it->joinable())
-            {
-                // If the thread is not joinable, it has finished execution.
-                it = connectionThreads.erase(it); // Erase returns the next iterator.
-            }
-            else
-            {
-                ++it; // Move to the next thread.
+    while (running) {
+        int n = epoll_wait(efd, events, MAX_EVENTS, -1); // Wait indefinitely for events
+
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == sLink) {
+                // New connection on the listening socket
+                handleNewConnection();
             }
         }
     }
+}
 
-    /**
-     * @brief Main loop for accepting and handling client connections.
-     *
-     * Continuously monitors the epoll instance for I/O events on the listening socket and connected client sockets.
-     * Accepts new connections, sets them to non-blocking mode, and dispatches them to handler threads.
-     */
-    void run()
-    {
-        auto lastCleanupTime = std::chrono::steady_clock::now(); // Initialize the last cleanup time
-
-        const int MAX_EVENTS = 10;
-        struct epoll_event events[MAX_EVENTS]; // Buffer where events are returned
-
-        while (running)
-        {
-            int n = epoll_wait(efd, events, MAX_EVENTS, -1); // Wait indefinitely for events
-
-            for (int i = 0; i < n; ++i)
-            {
-                if (events[i].data.fd == sLink)
-                {
-                    // New connection on the listening socket
-                    while (true)
-                    {
-                        int connection = amilinkAccept(sLink); // Use your existing accept function
-                        if (connection < 0)
-                        {
-                            if (errno != EAGAIN && errno != EWOULDBLOCK)
-                            {
-                                perror("accept");
-                            }
-                            break; // No more incoming connections
-                        }
-
-                        setNonBlocking(connection); // Set new connection to non-blocking mode
-
-                        struct epoll_event client_event;
-                        client_event.data.fd = connection;
-                        client_event.events = EPOLLIN | EPOLLET; // Read events, Edge Triggered mode
-                        if (epoll_ctl(efd, EPOLL_CTL_ADD, connection, &client_event) == -1)
-                        {
-                            perror("epoll_ctl: add");
-                            amilinkClose(connection); // Close the socket on error
-                        }
-                        else
-                        {
-                            auto threadData = std::make_shared<ThreadData>();
-                            threadData->connection = connection;
-                            threadData->mysqlManager = mysqlManager; // Assuming mysqlManager is a shared_ptr
-
-                            connectionThreads.emplace_back([threadData = std::move(threadData)]()
-                                                           { connectionHandler(threadData.get()); });
-                        }
-                    }
-                }
-                else
-                {
-                    // Existing connection has data or can be written
-                    // You might want to handle this directly or offload to another thread,
-                    // depending on your application's design
-                }
+void Server::handleNewConnection() {
+    while (true) {
+        int connection = amilinkAccept(sLink); // Use your existing accept function
+        if (connection < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("accept");
             }
+            break; // No more incoming connections
+        }
 
-            // Check if it's time to perform cleanup
-            auto currentTime = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastCleanupTime).count() >= 35000)
-            {
-                cleanUpFinishedThreads();      // Perform the cleanup of finished threads
-                lastCleanupTime = currentTime; // Reset the cleanup timer
-            }
+        setNonBlocking(connection); // Set new connection to non-blocking mode
+
+        struct epoll_event client_event;
+        client_event.data.fd = connection;
+        client_event.events = EPOLLIN | EPOLLET; // Read events, Edge Triggered mode
+        if (epoll_ctl(efd, EPOLL_CTL_ADD, connection, &client_event) == -1) {
+            perror("epoll_ctl: add");
+            amilinkClose(connection); // Close the socket on error
+        } else {
+            activeConnections++;
+            adjustThreadPoolSize(); // Adjust thread pool size based on active connections
+
+            auto threadData = std::make_shared<ThreadData>();
+            threadData->connection = connection;
+            threadData->mysqlManager = mysqlManager; // Assuming mysqlManager is a shared_ptr
+
+            threadPool.enqueue([threadData, this] {
+                connectionHandler(threadData.get());
+                activeConnections--;
+                adjustThreadPoolSize(); // Adjust thread pool size after handling the connection
+            });
         }
     }
+}
 
-private:
-    /*
-     * @brief Discusses the benefits of non-blocking mode for I/O operations.
-     *
-     * Setting a file descriptor to non-blocking mode has several advantages,
-     * particularly in network programming and high-concurrency systems:
-     *
-     * - **Improved Resource Utilization**: In non-blocking mode, a thread does not
-     *   wait for an I/O operation to complete and can continue performing other
-     *   tasks. This leads to more efficient use of CPU resources compared to blocking mode,
-     *   where the thread is put to sleep.
-     *
-     * - **Increased Concurrency**: Allows a single thread to manage multiple I/O operations
-     *   on different file descriptors simultaneously, enhancing the concurrency of the application
-     *   without the need for multiple threads.
-     *
-     * - **Better Responsiveness and Throughput**: The server remains responsive under high load
-     *   and can continue to service new and ready connections, thus improving overall throughput
-     *   and user experience.
-     *
-     * - **Scalability**: Scales well with the number of client connections by minimizing the overhead
-     *   of managing multiple threads, especially beneficial under high network load.
-     *
-     * - **Control and Flexibility**: Offers more control over I/O operations, allowing the application
-     *   to implement sophisticated handling strategies such as batching, prioritizing, and custom
-     *   timeouts.
-     *
-     * Note: While non-blocking I/O increases performance and scalability, it also adds complexity
-     * to error handling and state management. Frameworks or libraries can help manage this complexity.
-     */
-    void setNonBlocking(int sock)
-    {
-        int flags = fcntl(sock, F_GETFL, 0);
-        if (flags != -1)
-        {
-            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-        }
+bool Server::modifyEpollEvent(int efd, int fd, int events) {
+    struct epoll_event event;
+    event.data.fd = fd;
+    event.events = events;
+    if (epoll_ctl(efd, EPOLL_CTL_MOD, fd, &event) == -1) {
+        perror("epoll_ctl: mod");
+        return false;
+    }
+    return true;
+}
+
+void Server::setNonBlocking(int sock) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    }
+}
+
+void Server::adjustThreadPoolSize() {
+    size_t queueSize = threadPool.getQueueSize();
+    size_t currentSize = threadPool.getSize(); // Replace getActiveThreads() with getSize()
+    size_t newSize = currentSize;
+
+    if (queueSize > currentSize) {
+        newSize = std::min(currentSize * 2, queueSize + currentSize);
+    } else if (queueSize < currentSize / 2) {
+        newSize = std::max(currentSize / 2, size_t(10));
     }
 
-    int sPort;                                            ///< Port number on which the server listens for incoming connections.
-    bool sVerbose;                                        ///< Flag indicating whether verbose logging is enabled.
-    std::atomic<bool> running;                            ///< Atomic flag controlling the main loop execution.
-    std::shared_ptr<MySqlConnectionManager> mysqlManager; ///< Shared pointer to the MySQL connection manager.
-    std::thread mainThread;                               ///< Thread object for the server's main loop.
-    int efd;                                              ///< File descriptor for the epoll instance.
-    std::vector<std::thread> connectionThreads;           ///< Container for active connection handler threads.
-};
+    threadPool.resize(newSize);
+}
 
-static Server *globalServer = nullptr;
+
 
 void serverInit(uint16_t port, bool verbose)
 {
@@ -447,7 +869,6 @@ void serverInit(uint16_t port, bool verbose)
     {
         // Initialize MySqlConnectionManager
         sVerbose = verbose;
-        sLink = amilinkListen(port);
 
         std::cout << "Preparing to listen on port " << port << std::endl;
         std::string configFile = "db_config.txt"; // Provide the path to the config file
