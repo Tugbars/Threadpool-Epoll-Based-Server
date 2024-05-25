@@ -16,7 +16,7 @@
 #include "amilink/amilink.h"
 #include "plf/plf.h"
 #include "mqs/mqs.h"
-#include "aminicserver.h"
+#include "server.h"
 #include "mysql.h"
 
 // include the file library in your makefile.
@@ -27,7 +27,6 @@
 
 //--------------------Local data -------------------------------------------------------
 
-static int sLink = -1;
 static bool sVerbose = false;
 static std::atomic<int32_t> connectionId(0); // Global atomic counter for connection IDs
 static bool isAlgorithmNeeded = false;
@@ -634,10 +633,10 @@ static bool handleRequest(int efd, int connection, uint64_t &idDevice, MqsCldMsg
     return more;
 }
 
-struct ThreadData
-{
+struct ThreadData {
     int connection;                                       // Connection identifier or file descriptor
     std::shared_ptr<MySqlConnectionManager> mysqlManager; // Shared pointer for thread safety and RAII
+    EpollContext *epollContext;                           // Pointer to the epoll context
 };
 
 /**
@@ -661,17 +660,17 @@ struct ThreadData
  *       handles potential disconnects and inactivity using a loop that checks for message receipt and inactivity
  *       timeouts.
  */
-static void *connectionHandler(void *pData)
-{
+
+static void *connectionHandler(void *pData) {
     auto data = static_cast<ThreadData *>(pData); // Direct use if passing raw but better to pass smart pointers directly
     int connection = data->connection;
+    EpollContext &epollContext = *data->epollContext;
 
     uint64_t idDevice = 0;
     int32_t localConnectionId = connectionId.fetch_add(1, std::memory_order_relaxed);
 
     bool more = true;
-    if (sVerbose)
-    {
+    if (sVerbose) {
         std::cout << "New connection " << localConnectionId << std::endl;
     }
     int32_t msgCount = 0;
@@ -680,29 +679,23 @@ static void *connectionHandler(void *pData)
     time_t lastMessage = time(nullptr);
     auto conn = data->mysqlManager->getConnection();
 
-    while (more)
-    {
+    while (more) {
         msgCount++;
         MqsCldMsg_t request;
-        if (sVerbose)
-        {
+        if (sVerbose) {
             std::cout << "Waiting for message " << msgCount << " on connection " << localConnectionId << std::endl;
         }
 
         // Wait for events on this connection
         struct epoll_event event;
-        int n = epoll_wait(globalServer->efd, &event, 1, -1);
+        int n = epoll_wait(epollContext.efd, &event, 1, -1);
 
-        if (n > 0 && event.data.fd == connection)
-        {
+        if (n > 0 && event.data.fd == connection) {
             int32_t messageLength = amilinkReadMessage(connection, request);
-            if (messageLength > 0)
-            {
-                more = handleRequest(globalServer->efd, connection, idDevice, request, rawDataSetAssemblyBuffer, maxAssemblyLength, conn);
+            if (messageLength > 0) {
+                more = handleRequest(epollContext.efd, connection, idDevice, request, rawDataSetAssemblyBuffer, maxAssemblyLength, conn);
                 time(&lastMessage);
-            }
-            else
-            {
+            } else {
                 time_t now = time(nullptr);
                 bool activity = (lastMessage + MAX_INACTIVITY) > now;
                 more = activity && amilinkHeartbeat(connection);
@@ -710,27 +703,27 @@ static void *connectionHandler(void *pData)
         }
     }
     // Cleanup epoll instance for this connection
-    epoll_ctl(globalServer->efd, EPOLL_CTL_DEL, connection, nullptr);
+    epoll_ctl(epollContext.efd, EPOLL_CTL_DEL, connection, nullptr);
 
     data->mysqlManager->returnConnection(conn);
     amilinkClose(connection);
-    if (sVerbose)
-    {
+    if (sVerbose) {
         std::cout << "Terminating connection " << localConnectionId << std::endl;
     }
     return NULL;
 }
 
 Server::Server(uint16_t port, bool verbose, std::shared_ptr<MySqlConnectionManager> mysqlManager)
-    : sPort(port), sVerbose(verbose), running(false), mysqlManager(mysqlManager), efd(-1), threadPool(10), activeConnections(0) // Initialize with 10 threads
+    : sPort(port), sVerbose(verbose), running(false), mysqlManager(mysqlManager), sLink(-1), threadPool(10), activeConnections(0)
 {
-    // Constructor body, if needed
+    // Initialize epoll context
+    epollContext.efd = -1; // Initial invalid value
 }
 
 Server::~Server() {
     stop();
-    if (efd >= 0)
-        close(efd);
+    if (epollContext.efd >= 0)
+        close(epollContext.efd);
     if (sLink >= 0)
         close(sLink);
 }
@@ -748,14 +741,14 @@ bool Server::initialize() {
     if (fcntl(sLink, F_SETFL, flags | O_NONBLOCK) == -1)
         return false;
 
-    efd = epoll_create1(0);
-    if (efd == -1)
+    epollContext.efd = epoll_create1(0);
+    if (epollContext.efd == -1)
         return false;
 
     struct epoll_event event;
     event.data.fd = sLink;
     event.events = EPOLLIN; // Interested in read events
-    if (epoll_ctl(efd, EPOLL_CTL_ADD, sLink, &event) == -1)
+    if (epoll_ctl(epollContext.efd, EPOLL_CTL_ADD, sLink, &event) == -1)
         return false;
 
     return true;
@@ -779,16 +772,21 @@ void Server::stop() {
 }
 
 void Server::run() {
-    const int MAX_EVENTS = 10;
-    struct epoll_event events[MAX_EVENTS]; // Buffer where events are returned
+    const int INITIAL_EVENTS = 10;
+    epollContext.events.resize(INITIAL_EVENTS); // Initial buffer size
 
     while (running) {
-        int n = epoll_wait(efd, events, MAX_EVENTS, -1); // Wait indefinitely for events
+        int n = epoll_wait(epollContext.efd, epollContext.events.data(), epollContext.events.size(), -1); // Wait indefinitely for events
+
+        // Resize the events buffer based on the number of active connections before handling new connections
+        epollContext.events.resize(INITIAL_EVENTS + activeConnections.load());
 
         for (int i = 0; i < n; ++i) {
-            if (events[i].data.fd == sLink) {
+            if (epollContext.events[i].data.fd == sLink) {
                 // New connection on the listening socket
                 handleNewConnection();
+            } else {
+                // Handle other events or errors
             }
         }
     }
@@ -809,7 +807,7 @@ void Server::handleNewConnection() {
         struct epoll_event client_event;
         client_event.data.fd = connection;
         client_event.events = EPOLLIN | EPOLLET; // Read events, Edge Triggered mode
-        if (epoll_ctl(efd, EPOLL_CTL_ADD, connection, &client_event) == -1) {
+        if (epoll_ctl(epollContext.efd, EPOLL_CTL_ADD, connection, &client_event) == -1) {
             perror("epoll_ctl: add");
             amilinkClose(connection); // Close the socket on error
         } else {
@@ -819,6 +817,7 @@ void Server::handleNewConnection() {
             auto threadData = std::make_shared<ThreadData>();
             threadData->connection = connection;
             threadData->mysqlManager = mysqlManager; // Assuming mysqlManager is a shared_ptr
+            threadData->epollContext = &epollContext; // Assign epollContext
 
             threadPool.enqueue([threadData, this] {
                 connectionHandler(threadData.get());
@@ -860,8 +859,6 @@ void Server::adjustThreadPoolSize() {
 
     threadPool.resize(newSize);
 }
-
-
 
 void serverInit(uint16_t port, bool verbose)
 {
