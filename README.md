@@ -4,6 +4,8 @@
 
 This repository contains a C++ application designed to efficiently manage client connections and MySQL database interactions using a hybrid approach that combines non-blocking sockets, `epoll`, and a thread pool. This design ensures scalability, efficiency, and simplicity in handling numerous client connections and database operations. Each connection is supported by one thread, but with a few tweaks, this can be scaled up to handle multiple connections per thread, leveraging the full potential of the thread pool and `epoll`.
 
+The server is based on the TCP communication protocol, utilizes heartbeats for client connectivity management, and supports a dual-stack IP approach (IPv4 and IPv6).
+
 ## Design Decisions
 
 ### One Thread per Socket
@@ -56,7 +58,7 @@ In practice, combining both approaches can provide a balance:
 
 ## Implementation Details
 
-### Server
+### Server Code
 
 The server utilizes non-blocking sockets and `epoll` for efficient I/O multiplexing, combined with a thread pool to handle client connections and perform tasks asynchronously. Each connection is supported by one thread, but this design can be scaled up to handle multiple connections per thread with a few adjustments.
 
@@ -65,6 +67,9 @@ The server utilizes non-blocking sockets and `epoll` for efficient I/O multiplex
 - **Server Class**: Manages the main server operations, including initializing the server, handling new connections, and managing the `epoll` instance.
 - **Connection Handler**: Handles individual client connections in separate threads, processing incoming messages and maintaining the connection state.
 - **Thread Pool**: Manages a pool of worker threads to execute tasks. Supports dynamic resizing, pausing, and resuming.
+- **TCP Communication**: Utilizes TCP for reliable data transmission.
+- **Heartbeat Mechanism**: Sends periodic heartbeat messages to maintain client connectivity.
+- **Dual-Stack IP Support**: Supports both IPv4 and IPv6, ensuring broader compatibility and future-proofing.
 
 ### MySQL Connection Pool
 
@@ -88,7 +93,7 @@ The server class initializes the server, sets up the `epoll` instance, and manag
 - **handleNewConnection**: Accepts new client connections and adds them to the `epoll` instance. Each connection is handled in a separate thread from the thread pool.
 - **adjustThreadPoolSize**: Dynamically adjusts the size of the thread pool based on the current workload, ensuring optimal resource utilization.
 
-## MySQL Connection Pool Implementation
+### MySQL Connection Pool Implementation
 
 The `MySqlConnectionPool` class manages a pool of connections to the MySQL database, providing efficient reuse of connections and ensuring thread safety.
 
