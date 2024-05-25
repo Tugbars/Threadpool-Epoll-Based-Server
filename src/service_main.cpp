@@ -11,7 +11,7 @@
 #include "plf/plf.h"
 #include "plf/crc/crc16.h"
 #include "amilink/amilink.h"
-#include "aminicserver.h"
+#include "server.h"
 #include "mysql.h"
 
  //--------------------Local defines  -------------------------------------------------------
