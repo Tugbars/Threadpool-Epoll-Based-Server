@@ -1,8 +1,3 @@
-/*******************************************************************************
- * TekPartner A/S
- * $Header: https://svn.tekpartner.dk/svn/ANI_P01/sw/tags/mqs_v2_r561/tools/common/amilink/amilink.h 478 2020-12-26 17:26:27Z KNY $
- *******************************************************************************/
-
 #ifndef AMILINK_H
 #define AMILINK_H
 
