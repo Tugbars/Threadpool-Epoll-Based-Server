@@ -68,31 +68,6 @@
 
 /***************************************** Private functions *****************************************/
 
-/*
-int32_t IPUtilHostToIp(const char *host, struct sockaddr_storage *addr) {
-    struct addrinfo hints = {}, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC; // Allow IPv4 or IPv6
-    hints.ai_socktype = SOCK_STREAM;
-
-    int result = getaddrinfo(host, NULL, &hints, &res);
-    if (result != 0) {
-        fprintf(stderr, "Error getting address info for %s: %s\n", host, gai_strerror(result));
-        return -1;
-    }
-
-    // Copy the first resolved address to the caller's storage
-    if (res->ai_family == AF_INET) { // IPv4
-        memcpy(addr, res->ai_addr, sizeof(struct sockaddr_in));
-    } else { // IPv6
-        memcpy(addr, res->ai_addr, sizeof(struct sockaddr_in6));
-    }
-
-    freeaddrinfo(res);
-    return 0;
-}
-*/
-
 int IPUtilAccept(int socket)
 {
     struct sockaddr_in client;
