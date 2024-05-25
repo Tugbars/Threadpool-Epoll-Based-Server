@@ -1,5 +1,5 @@
-#ifndef AMINICSERVER_H
-#define AMINICSERVER_H
+#ifndef SERVER_H
+#define SERVER_H
 
 #include <stdint.h>
 #include <vector>
