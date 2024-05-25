@@ -58,7 +58,7 @@ In practice, combining both approaches can provide a balance:
 
 ## Implementation Details
 
-### Server Code
+### Server 
 
 The server utilizes non-blocking sockets and `epoll` for efficient I/O multiplexing, combined with a thread pool to handle client connections and perform tasks asynchronously. Each connection is supported by one thread, but this design can be scaled up to handle multiple connections per thread with a few adjustments.
 
